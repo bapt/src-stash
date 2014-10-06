@@ -1,0 +1,210 @@
+Index: sys/event.h
+===================================================================
+diff --git a/head/sys/sys/event.h b/head/sys/sys/event.h
+--- a/head/sys/sys/event.h	(revision 272349)
++++ b/head/sys/sys/event.h	(working copy)
+@@ -55,6 +55,18 @@
+ 	(kevp)->udata = (f);			\
+ } while(0)
+ 
++#define EV_SET64(kevp, a, b, c, d, e, f, g, h) do {	\
++	struct kevent64_s *__kevp__ = (kevp);		\
++	__kevp__->ident = (a);				\
++	__kevp__->filter = (b);				\
++	__kevp__->flags = (c);				\
++	__kevp__->fflags = (d);				\
++	__kevp__->data = (e);				\
++	__kevp__->udata = (f);				\
++	__kevp__->ext[0] = (g);				\
++	__kevp__->ext[1] = (h);				\
++} while(0)
++
+ struct kevent {
+ 	uintptr_t	ident;		/* identifier for this event */
+ 	short		filter;		/* filter for event */
+@@ -64,6 +76,16 @@
+ 	void		*udata;		/* opaque user data identifier */
+ };
+ 
++struct kevent64_s {
++	uint64_t	ident;		/* identifier for this event */
++	int16_t		filter;		/* filter for event */
++	uint16_t	flags;
++	uint32_t	fflags;
++	int64_t		data;
++	uint64_t	udata;		/* opaque user data identifier */
++	uint64_t	ext[2];		/* filter-specific extensions */
++};
++
+ /* actions */
+ #define EV_ADD		0x0001		/* add event to kq (implies enable) */
+ #define EV_DELETE	0x0002		/* delete event from kq */
+@@ -188,7 +210,7 @@
+ 	int	(*f_attach)(struct knote *kn);
+ 	void	(*f_detach)(struct knote *kn);
+ 	int	(*f_event)(struct knote *kn, long hint);
+-	void	(*f_touch)(struct knote *kn, struct kevent *kev, u_long type);
++	void	(*f_touch)(struct knote *kn, struct kevent64_s *kev, u_long type);
+ };
+ 
+ /*
+@@ -203,7 +225,7 @@
+ 	struct			knlist *kn_knlist;	/* f_attach populated */
+ 	TAILQ_ENTRY(knote)	kn_tqe;
+ 	struct			kqueue *kn_kq;	/* which queue we are on */
+-	struct 			kevent kn_kevent;
++	struct 			kevent64_s kn_kevent;
+ 	int			kn_status;	/* protected by kq lock */
+ #define KN_ACTIVE	0x01			/* event has been triggered */
+ #define KN_QUEUED	0x02			/* event is on queue */
+@@ -226,6 +248,7 @@
+ 	struct			filterops *kn_fop;
+ 	void			*kn_hook;
+ 	int			kn_hookid;
++	int64_t			kn_sdata;
+ 
+ #define kn_id		kn_kevent.ident
+ #define kn_filter	kn_kevent.filter
+@@ -236,8 +259,8 @@
+ };
+ struct kevent_copyops {
+ 	void	*arg;
+-	int	(*k_copyout)(void *arg, struct kevent *kevp, int count);
+-	int	(*k_copyin)(void *arg, struct kevent *kevp, int count);
++	int	(*k_copyout)(void *arg, struct kevent64_s *kevp, int count);
++	int	(*k_copyin)(void *arg, struct kevent64_s *kevp, int count);
+ };
+ 
+ struct thread;
+@@ -265,7 +288,7 @@
+ #define knlist_delete(knl, td, islocked)			\
+ 		knlist_cleardel((knl), (td), (islocked), 1)
+ extern void	knote_fdclose(struct thread *p, int fd);
+-extern int 	kqfd_register(int fd, struct kevent *kev, struct thread *p,
++extern int 	kqfd_register(int fd, struct kevent64_s *kev, struct thread *p,
+ 		    int waitok);
+ extern int	kqueue_add_filteropts(int filt, struct filterops *filtops);
+ extern int	kqueue_del_filteropts(int filt);
+@@ -280,6 +303,10 @@
+ int     kevent(int kq, const struct kevent *changelist, int nchanges,
+ 	    struct kevent *eventlist, int nevents,
+ 	    const struct timespec *timeout);
++int	kevent64(int kq, const struct kevent64_s *changelist,
++	    int nchanges, struct kevent64_s *eventlist,
++	    int nevents, unsigned int flags,
++	    const struct timespec *timeout);
+ __END_DECLS
+ 
+ #endif /* !_KERNEL */
+Index: kern/kern_event.c
+===================================================================
+diff --git a/head/sys/kern/kern_event.c b/head/sys/kern/kern_event.c
+--- a/head/sys/kern/kern_event.c	(revision 272349)
++++ b/head/sys/kern/kern_event.c	(working copy)
+@@ -93,9 +93,9 @@
+ 
+ TASKQUEUE_DEFINE_THREAD(kqueue);
+ 
+-static int	kevent_copyout(void *arg, struct kevent *kevp, int count);
+-static int	kevent_copyin(void *arg, struct kevent *kevp, int count);
+-static int	kqueue_register(struct kqueue *kq, struct kevent *kev,
++static int	kevent_copyout(void *arg, struct kevent64_s *kevp, int count);
++static int	kevent_copyin(void *arg, struct kevent64_s *kevp, int count);
++static int	kqueue_register(struct kqueue *kq, struct kevent64_s *kev,
+ 		    struct thread *td, int waitok);
+ static int	kqueue_acquire(struct file *fp, struct kqueue **kqp);
+ static void	kqueue_release(struct kqueue *kq, int locked);
+@@ -105,7 +105,7 @@
+ static int	kqueue_scan(struct kqueue *kq, int maxevents,
+ 		    struct kevent_copyops *k_ops,
+ 		    const struct timespec *timeout,
+-		    struct kevent *keva, struct thread *td);
++		    struct kevent64_s *keva, struct thread *td);
+ static void 	kqueue_wakeup(struct kqueue *kq);
+ static struct filterops *kqueue_fo_find(int filt);
+ static void	kqueue_fo_release(int filt);
+@@ -153,7 +153,7 @@
+ static int	filt_userattach(struct knote *kn);
+ static void	filt_userdetach(struct knote *kn);
+ static int	filt_user(struct knote *kn, long hint);
+-static void	filt_usertouch(struct knote *kn, struct kevent *kev,
++static void	filt_usertouch(struct knote *kn, struct kevent64_s *kev,
+ 		    u_long type);
+ 
+ static struct filterops file_filtops = {
+@@ -457,7 +457,7 @@
+ {
+ 	struct kqueue *kq;
+ 	struct knote *kn;
+-	struct kevent kev;
++	struct kevent64_s kev;
+ 	int error;
+ 
+ 	if (list == NULL)
+@@ -669,7 +669,7 @@
+ }
+ 
+ static void
+-filt_usertouch(struct knote *kn, struct kevent *kev, u_long type)
++filt_usertouch(struct knote *kn, struct kevent64_s *kev, u_long type)
+ {
+ 	u_int ffctrl;
+ 
+@@ -780,9 +780,9 @@
+ #ifndef _SYS_SYSPROTO_H_
+ struct kevent_args {
+ 	int	fd;
+-	const struct kevent *changelist;
++	const struct kevent64_s *changelist;
+ 	int	nchanges;
+-	struct	kevent *eventlist;
++	struct	kevent64_s *eventlist;
+ 	int	nevents;
+ 	const struct timespec *timeout;
+ };
+@@ -813,13 +813,13 @@
+ #ifdef KTRACE
+ 	if (KTRPOINT(td, KTR_GENIO)) {
+ 		ktriov.iov_base = uap->changelist;
+-		ktriov.iov_len = uap->nchanges * sizeof(struct kevent);
++		ktriov.iov_len = uap->nchanges * sizeof(struct kevent64_s);
+ 		ktruio = (struct uio){ .uio_iov = &ktriov, .uio_iovcnt = 1,
+ 		    .uio_segflg = UIO_USERSPACE, .uio_rw = UIO_READ,
+ 		    .uio_td = td };
+ 		ktruioin = cloneuio(&ktruio);
+ 		ktriov.iov_base = uap->eventlist;
+-		ktriov.iov_len = uap->nevents * sizeof(struct kevent);
++		ktriov.iov_len = uap->nevents * sizeof(struct kevent64_s);
+ 		ktruioout = cloneuio(&ktruio);
+ 	}
+ #endif
+@@ -829,9 +829,9 @@
+ 
+ #ifdef KTRACE
+ 	if (ktruioin != NULL) {
+-		ktruioin->uio_resid = uap->nchanges * sizeof(struct kevent);
++		ktruioin->uio_resid = uap->nchanges * sizeof(struct kevent64_s);
+ 		ktrgenio(uap->fd, UIO_WRITE, ktruioin, 0);
+-		ktruioout->uio_resid = td->td_retval[0] * sizeof(struct kevent);
++		ktruioout->uio_resid = td->td_retval[0] * sizeof(struct kevent64_s);
+ 		ktrgenio(uap->fd, UIO_READ, ktruioout, error);
+ 	}
+ #endif
+@@ -843,7 +843,7 @@
+  * Copy 'count' items into the destination list pointed to by uap->eventlist.
+  */
+ static int
+-kevent_copyout(void *arg, struct kevent *kevp, int count)
++kevent_copyout(void *arg, struct kevent64_s *kevp, int count)
+ {
+ 	struct kevent_args *uap;
+ 	int error;
+@@ -861,7 +861,7 @@
+  * Copy 'count' items from the list pointed to by uap->changelist.
+  */
+ static int
+-kevent_copyin(void *arg, struct kevent *kevp, int count)
++kevent_copyin(void *arg, struct kevent64_s *kevp, int count)
+ {
+ 	struct kevent_args *uap;
+ 	int error;
